@@ -1,0 +1,17 @@
+# Visual Studio build output
+x64/
+Debug/
+Release/
+*.user
+*.aps
+*.pch
+*.ilk
+*.obj
+*.pdb
+*.idb
+
+# Visual Studio IDE files
+.vs/
+
+# Claude Code internal files
+.claude/
