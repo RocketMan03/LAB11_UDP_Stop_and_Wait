@@ -66,6 +66,12 @@ int getChecksum(Frame frame)
 	return (int)(unsigned short)(~onesCompSum(&frame, sizeof(Frame)));
 }
 
+static void AppendToEdit(CEdit& edit, const CString& str)
+{
+	int len = edit.GetWindowTextLengthW();
+	edit.SetSel(len, len);
+	edit.ReplaceSel(str);
+}
 
 CUDPClientThdDlg::CUDPClientThdDlg(CWnd* pParent /*=nullptr*/)
 	: CDialogEx(IDD_UDPCLIENTTHD_DIALOG, pParent)
@@ -100,8 +106,9 @@ BEGIN_MESSAGE_MAP(CUDPClientThdDlg, CDialogEx)
 END_MESSAGE_MAP()
 
 
-// RX 큐에 쌓인 문자열을 꺼내 수신 에디트박스에 표시하는 스레드
-// 피기배킹 타임아웃(200ms) 초과 시 보류 ACK를 순수 ACK로 즉시 전송
+// RX 스레드:
+// 1. RX 큐에서 완성 메시지를 꺼내 수신 에디트박스에 출력
+// 2. 피기배킹 타임아웃(1000ms) 감시 — 초과 시 순수 ACK 프레임 즉시 전송
 UINT RXThread(LPVOID arg)
 {
 	const int PIGGY_TIMEOUT_MS = 1000;
@@ -114,23 +121,23 @@ UINT RXThread(LPVOID arg)
 		POSITION current_pos;
 		while (pos != NULL) {
 			current_pos = pos;
+			// [1] RX 큐에서 메시지 꺼냄 (rx_cs 보호)
 			rx_cs.Lock();
 			CString str = plist->GetNext(pos);
 			rx_cs.Unlock();
 
-			int len = pDlg->m_rx_edit.GetWindowTextLengthW();
-			pDlg->m_rx_edit.SetSel(len, len);
-			pDlg->m_rx_edit.ReplaceSel(str);
+			AppendToEdit(pDlg->m_rx_edit, str);
 
 			plist->RemoveAt(current_pos);
 		}
 
-		// 보류 중인 ACK가 타임아웃되면 순수 ACK 프레임으로 전송
+		// [2] 보류 ACK 타임아웃 감시 — 1000ms 초과 시 순수 ACK 전송
 		int pendingSeq = pDlg->m_pendingAckSeq;
 		if (pendingSeq != -1 &&
 			GetTickCount() - pDlg->m_pendingAckTime > PIGGY_TIMEOUT_MS)
 		{
 			if (pDlg->m_pDataSocket != NULL && !pDlg->m_serverIP.IsEmpty()) {
+				// [2] 타임아웃 초과 — 순수 ACK 프레임 구성 후 전송
 				Frame ackFrame;
 				ackFrame.frame_type = 1; // ACK
 				ackFrame.ack_num    = pendingSeq;
@@ -140,13 +147,8 @@ UINT RXThread(LPVOID arg)
 
 				CString strLog;
 				strLog.Format(_T("STANDALONE-ACK ack_num=%d\r\n"), pendingSeq);
-				int csLen = pDlg->m_CheckSum_rx.GetWindowTextLengthW();
-				pDlg->m_CheckSum_rx.SetSel(csLen, csLen);
-				pDlg->m_CheckSum_rx.ReplaceSel(strLog);
-
-				csLen = pDlg->m_CheckSum_rx.GetWindowTextLengthW();
-				pDlg->m_CheckSum_rx.SetSel(csLen, csLen);
-				pDlg->m_CheckSum_rx.ReplaceSel(_T("---------------------------\r\n"));
+				AppendToEdit(pDlg->m_CheckSum_rx, strLog);
+				AppendToEdit(pDlg->m_CheckSum_rx, _T("---------------------------\r\n"));
 			}
 		}
 
@@ -155,7 +157,12 @@ UINT RXThread(LPVOID arg)
 	return 0;
 }
 
-// TX 스레드: Stop-and-Wait, 프레임 전송 후 ACK 대기, 타임아웃/NAK 시 재전송
+// TX 스레드:
+// 1. TX 큐에서 메시지를 꺼냄
+// 2. 메시지를 청크 단위로 분할해 순서대로 전송
+// 3. DATA 프레임 구성 및 피기배킹 ACK 탑재
+// 4. Stop-and-Wait: 전송 후 ACK 대기, 타임아웃/NAK 시 최대 5회 재전송
+// 5. 전송 완료 후 전송률(KB/s) 계산 출력
 UINT TXThread(LPVOID arg)
 {
 	const int TIMEOUT_MS = 2000; // ACK 대기 타임아웃 (ms)
@@ -172,6 +179,7 @@ UINT TXThread(LPVOID arg)
 		POSITION current_pos;
 		while (pos != NULL) {
 			current_pos = pos;
+			// [1] TX 큐에서 메시지 꺼냄 (tx_cs 보호)
 			tx_cs.Lock();
 			CString str = plist->GetNext(pos);
 			tx_cs.Unlock();
@@ -185,6 +193,7 @@ UINT TXThread(LPVOID arg)
 				bool msgFailed = false;
 				DWORD startTime = GetTickCount();
 
+				// [2] 청크 단위로 메시지 전체를 순회, is_last_Frame으로 마지막 청크 표시
 				do {
 					if (!pArg->Thread_run) { msgFailed = true; break; }
 
@@ -193,13 +202,13 @@ UINT TXThread(LPVOID arg)
 					bool ackOk  = false;
 
 					while (!ackOk && retries <= MAX_RETRY && pArg->Thread_run) {
-						// DATA 프레임 구성
+						// [3] DATA 프레임 구성: seq_num, frame_type, Frame_num, is_last_Frame 설정
 						_tcscpy_s(frame.p_buffer, _countof(frame.p_buffer), chunk);
 						frame.frame_type    = 0; // DATA
 						frame.Frame_num     = frameNum;
 						frame.is_last_Frame = (offset + chunkLen >= totalLen) ? 1 : 0;
 
-						// 보류 중인 ACK가 있으면 피기배킹
+						// [3] 보류 중인 ACK가 있으면 DATA 프레임에 피기배킹
 						frame.has_piggybacked_ack = 0;
 						frame.ack_num = 0;
 						int pendingAck = pDlg->m_pendingAckSeq;
@@ -208,18 +217,16 @@ UINT TXThread(LPVOID arg)
 							frame.ack_num = pendingAck;
 							pDlg->m_pendingAckSeq = -1;
 
-							int rxLen = pDlg->m_CheckSum_rx.GetWindowTextLengthW();
-							pDlg->m_CheckSum_rx.SetSel(rxLen, rxLen);
-							pDlg->m_CheckSum_rx.ReplaceSel(_T("---------------------------\r\n"));
+							AppendToEdit(pDlg->m_CheckSum_rx, _T("---------------------------\r\n"));
 						}
 
 						frame.checksum = getChecksum(frame);
 
-						// 이전 ACK 신호 초기화 후 전송
+						// [4] SendTo 전에 리셋해야 이전 잔여 이벤트를 오인하지 않음
 						ResetEvent(pDlg->m_hAckEvent);
 						pDlg->m_pDataSocket->SendTo(&frame, sizeof(Frame), 8000, pDlg->m_serverIP);
 
-						// TX 로그
+						// [4] 최초 전송이면 TX 로그, 재전송이면 RETRY#N 로그
 						CString strLog;
 						if (retries == 0) {
 							if (frame.has_piggybacked_ack)
@@ -237,11 +244,9 @@ UINT TXThread(LPVOID arg)
 							strLog.Format(_T("RETRY#%d seq=%d frame=%d cs=0x%04X\r\n"),
 								retries, frame.seq_num, frame.Frame_num,
 								(unsigned short)frame.checksum);
-						int csLen = pDlg->m_CheckSum_tx.GetWindowTextLengthW();
-						pDlg->m_CheckSum_tx.SetSel(csLen, csLen);
-						pDlg->m_CheckSum_tx.ReplaceSel(strLog);
+						AppendToEdit(pDlg->m_CheckSum_tx, strLog);
 
-						// ACK/NAK 대기
+						// [4] ACK/NAK 대기 — ProcessReceive가 SetEvent로 깨움, 2000ms 초과 시 TIMEOUT
 						DWORD wr = WaitForSingleObject(pDlg->m_hAckEvent, TIMEOUT_MS);
 
 						if (wr == WAIT_OBJECT_0
@@ -251,9 +256,7 @@ UINT TXThread(LPVOID arg)
 							ackOk = true;
 							CString strAck;
 							strAck.Format(_T("[ACK] seq=%d OK\r\n"), frame.seq_num);
-							csLen = pDlg->m_CheckSum_tx.GetWindowTextLengthW();
-							pDlg->m_CheckSum_tx.SetSel(csLen, csLen);
-							pDlg->m_CheckSum_tx.ReplaceSel(strAck);
+							AppendToEdit(pDlg->m_CheckSum_tx, strAck);
 						}
 						else {
 							retries++;
@@ -267,37 +270,30 @@ UINT TXThread(LPVOID arg)
 							else
 								strRe.Format(_T("WRONG_ACK seq=%d retry=%d/%d\r\n"),
 									frame.seq_num, retries, MAX_RETRY);
-							csLen = pDlg->m_CheckSum_tx.GetWindowTextLengthW();
-							pDlg->m_CheckSum_tx.SetSel(csLen, csLen);
-							pDlg->m_CheckSum_tx.ReplaceSel(strRe);
+							AppendToEdit(pDlg->m_CheckSum_tx, strRe);
 						}
 					} // while retry
 
-					{
-						int csLen = pDlg->m_CheckSum_tx.GetWindowTextLengthW();
-						pDlg->m_CheckSum_tx.SetSel(csLen, csLen);
-						pDlg->m_CheckSum_tx.ReplaceSel(_T("---------------------------\r\n"));
-					}
+					AppendToEdit(pDlg->m_CheckSum_tx, _T("---------------------------\r\n"));
 
 					if (!pArg->Thread_run) { msgFailed = true; break; }
 
 					if (ackOk) {
-						frame.seq_num = (frame.seq_num + 1) % 2;
+						frame.seq_num = (frame.seq_num + 1) % 2; // [4] 1-bit 교대 seq: 0→1→0 순환
 						frameNum++;
 						offset += chunkLen;
 					}
 					else {
-						// 최대 재전송 초과, 해당 메시지 포기
+						// [4] 최대 재전송 횟수(5회) 초과, 해당 메시지 포기
 						CString strFail;
 						strFail.Format(_T("FAILED seq=%d: max retries\r\n"), frame.seq_num);
-						int csLen = pDlg->m_CheckSum_tx.GetWindowTextLengthW();
-						pDlg->m_CheckSum_tx.SetSel(csLen, csLen);
-						pDlg->m_CheckSum_tx.ReplaceSel(strFail);
+						AppendToEdit(pDlg->m_CheckSum_tx, strFail);
 						msgFailed = true;
 						break;
 					}
 				} while (offset < totalLen);
 
+				// [5] 전송 완료 후 전송률(KB/s) 계산 출력
 				if (!msgFailed) {
 					DWORD elapsed = GetTickCount() - startTime;
 					int totalBytes = totalLen * (int)sizeof(TCHAR);
@@ -307,9 +303,7 @@ UINT TXThread(LPVOID arg)
 							totalBytes, elapsed, (totalBytes * 1000.0) / 1024.0 / elapsed);
 					else
 						strRate.Format(_T("전송률: %d bytes / <1ms\r\n===========================\r\n"), totalBytes);
-					int csLen = pDlg->m_CheckSum_tx.GetWindowTextLengthW();
-					pDlg->m_CheckSum_tx.SetSel(csLen, csLen);
-					pDlg->m_CheckSum_tx.ReplaceSel(strRate);
+					AppendToEdit(pDlg->m_CheckSum_tx, strRate);
 				}
 
 				plist->RemoveAt(current_pos);
@@ -419,8 +413,13 @@ HCURSOR CUDPClientThdDlg::OnQueryDragIcon()
 	return static_cast<HCURSOR>(m_hIcon);
 }
 
-// 수신 처리: ACK/NAK 프레임이면 TX 스레드를 깨우고,
-// DATA 프레임이면 체크섬 검증 후 ACK/NAK 전송 및 재조합
+// ProcessReceive:
+// 1. 소켓에서 프레임 수신
+// 2. 순수 ACK/NAK 수신 시 TX 스레드에 SetEvent로 신호 전달
+// 3. DATA 프레임의 피기배킹 ACK 처리 — TX 스레드에 SetEvent로 신호 전달
+// 4. 체크섬 검증 — 손상 시 NAK 즉시 전송, 유효 시 ACK 보류(피기배킹 대기)
+// 5. 중복 프레임 검출 — seq 불일치 시 드랍
+// 6. 정상 프레임 재조합 — 마지막 프레임이면 완성 메시지를 RX 큐에 추가
 void CUDPClientThdDlg::ProcessReceive(CDataSocket* pSocket, int nErrorCode)
 {
 	Frame recvFrame;
@@ -428,11 +427,12 @@ void CUDPClientThdDlg::ProcessReceive(CDataSocket* pSocket, int nErrorCode)
 	UINT fromPort;
 	int nbytes;
 
+	// [1] 소켓에서 프레임 수신
 	nbytes = pSocket->ReceiveFrom(&recvFrame, sizeof(Frame), fromIP, fromPort);
 	if (nbytes <= 0)
 		return;
 
-	// 순수 ACK/NAK 수신, TX 스레드(Stop-and-Wait)에 신호 전달
+	// [2] 순수 ACK/NAK 수신 — TX 스레드에 SetEvent로 신호 전달
 	if (recvFrame.frame_type == 1 || recvFrame.frame_type == 2) {
 		m_ackSeqNum = recvFrame.ack_num;
 		m_ackType   = recvFrame.frame_type;
@@ -442,15 +442,11 @@ void CUDPClientThdDlg::ProcessReceive(CDataSocket* pSocket, int nErrorCode)
 		strLog.Format(_T("[%s] ack_num=%d\r\n"),
 			recvFrame.frame_type == 1 ? _T("ACK") : _T("NAK"),
 			recvFrame.ack_num);
-		int len = m_CheckSum_tx.GetWindowTextLengthW();
-		m_CheckSum_tx.SetSel(len, len);
-		m_CheckSum_tx.ReplaceSel(strLog);
+		AppendToEdit(m_CheckSum_tx, strLog);
 		return;
 	}
 
-	// DATA 프레임 처리
-
-	// 피기배킹된 ACK가 포함된 DATA 프레임이면 TX 스레드에 신호 전달
+	// [3] 피기배킹 ACK 처리 — TX 스레드에 SetEvent로 신호 전달
 	if (recvFrame.has_piggybacked_ack) {
 		m_ackSeqNum = recvFrame.ack_num;
 		m_ackType   = 1; // ACK
@@ -458,11 +454,10 @@ void CUDPClientThdDlg::ProcessReceive(CDataSocket* pSocket, int nErrorCode)
 
 		CString strLog;
 		strLog.Format(_T("[PIGGY-ACK] ack_num=%d\r\n"), recvFrame.ack_num);
-		int len = m_CheckSum_tx.GetWindowTextLengthW();
-		m_CheckSum_tx.SetSel(len, len);
-		m_CheckSum_tx.ReplaceSel(strLog);
+		AppendToEdit(m_CheckSum_tx, strLog);
 	}
 
+	// [4] 체크섬 검증 — ones complement 합산 후 ~결과가 0x0000이면 유효
 	unsigned short total = onesCompSum(&recvFrame, sizeof(Frame));
 	bool valid = ((~total & 0xFFFF) == 0);
 
@@ -472,12 +467,10 @@ void CUDPClientThdDlg::ProcessReceive(CDataSocket* pSocket, int nErrorCode)
 		recvFrame.is_last_Frame ? _T("[L]") : _T(""),
 		(unsigned short)recvFrame.checksum, total,
 		valid ? _T("OK") : _T("ERR"));
-	int csLen = m_CheckSum_rx.GetWindowTextLengthW();
-	m_CheckSum_rx.SetSel(csLen, csLen);
-	m_CheckSum_rx.ReplaceSel(strCS);
+	AppendToEdit(m_CheckSum_rx, strCS);
 
 	if (!valid) {
-		// NAK는 즉시 전송 (재전송을 빠르게 유도)
+		// [4] 체크섬 오류 — NAK 즉시 전송으로 재전송 유도
 		Frame nakFrame;
 		nakFrame.frame_type = 2; // NAK
 		nakFrame.ack_num    = recvFrame.seq_num;
@@ -486,42 +479,35 @@ void CUDPClientThdDlg::ProcessReceive(CDataSocket* pSocket, int nErrorCode)
 
 		CString strAck;
 		strAck.Format(_T("NAK ack_num=%d\r\n"), recvFrame.seq_num);
-		csLen = m_CheckSum_rx.GetWindowTextLengthW();
-		m_CheckSum_rx.SetSel(csLen, csLen);
-		m_CheckSum_rx.ReplaceSel(strAck);
+		AppendToEdit(m_CheckSum_rx, strAck);
 	}
 	else {
-		// 유효 DATA: ACK를 즉시 보내지 않고 피기배킹을 위해 보류
+		// [4] 체크섬 정상 — ACK 즉시 전송 대신 피기배킹 대기
 		m_pendingAckSeq  = recvFrame.seq_num;
 		m_pendingAckTime = GetTickCount();
 
 		CString strAck;
 		strAck.Format(_T("ACK 보류(피기배킹 대기) ack_num=%d\r\n"), recvFrame.seq_num);
-		csLen = m_CheckSum_rx.GetWindowTextLengthW();
-		m_CheckSum_rx.SetSel(csLen, csLen);
-		m_CheckSum_rx.ReplaceSel(strAck);
+		AppendToEdit(m_CheckSum_rx, strAck);
 	}
 
 	if (!valid)
-		return; // 손상 프레임: 재조합/기대 seq 갱신 안 함
+		return; // [4] 손상 프레임은 재조합/기대 seq 갱신 없이 버림
 
-	// 중복 검출: ACK 분실로 송신측이 재전송한 경우 — 피기배킹 ACK가 이미 보류됐으므로 폐기만 함
+	// [5] 중복 프레임 검출 — seq 불일치(ACK 분실로 재전송된 경우) 시 드랍, ACK 보류는 이미 됨
 	if (recvFrame.seq_num != m_expectedSeq)
 	{
 		CString strDup;
 		strDup.Format(_T("중복 seq=%d (예상=%d) -> ACK 재보류 & 드랍\r\n"),
 			recvFrame.seq_num, m_expectedSeq);
-		csLen = m_CheckSum_rx.GetWindowTextLengthW();
-		m_CheckSum_rx.SetSel(csLen, csLen);
-		m_CheckSum_rx.ReplaceSel(strDup);
+		AppendToEdit(m_CheckSum_rx, strDup);
 		return;
 	}
 
-	// 정상 순서 프레임: 다음 기대 seq 전진
+	// [6] 정상 순서 프레임 — 다음 기대 seq 전진
 	m_expectedSeq = (m_expectedSeq + 1) % 2;
 
-
-	// 재조합 버퍼에 누적
+	// [6] 재조합 버퍼에 청크 누적, 마지막 프레임이면 완성 메시지를 RX 큐에 추가
 	m_reassemBuf.push_back(recvFrame);
 
 	if (recvFrame.is_last_Frame)
