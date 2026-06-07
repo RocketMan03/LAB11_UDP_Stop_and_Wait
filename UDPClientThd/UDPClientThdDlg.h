@@ -14,10 +14,11 @@ struct Frame
 	int seq_num;
 	int ack_num;
 	int checksum;
-	int Frame_num;      // 메시지 내 프레임 번호 (0부터)
-	int is_last_Frame;  // 마지막 프레임이면 1, 아니면 0
-	int frame_type;     // 0=DATA, 1=ACK, 2=NAK
-	TCHAR p_buffer[8];  // 8 TCHAR = 16바이트 페이로드
+	int Frame_num;            // 메시지 내 프레임 번호 (0부터)
+	int is_last_Frame;        // 마지막 프레임이면 1, 아니면 0
+	int frame_type;           // 0=DATA, 1=ACK, 2=NAK
+	int has_piggybacked_ack;  // 1이면 ack_num에 피기배킹된 ACK 포함
+	TCHAR p_buffer[8];        // 8 TCHAR = 16바이트 페이로드
 
 	Frame() {
 		seq_num = 0;
@@ -26,6 +27,7 @@ struct Frame
 		Frame_num = 0;
 		is_last_Frame = 0;
 		frame_type = 0;
+		has_piggybacked_ack = 0;
 		memset(p_buffer, 0, sizeof(p_buffer));
 	}
 };
@@ -93,5 +95,9 @@ public:
 	HANDLE m_hAckEvent;       // TX 스레드가 ACK/NAK 도착을 기다리는 이벤트
 	volatile int m_ackSeqNum; // 수신된 ACK/NAK의 ack_num
 	volatile int m_ackType;   // 1=ACK, 2=NAK
-	int m_expectedSeq;   // 다음에 받을 차례인 seq (중복 검출용)
+	int m_expectedSeq;        // 다음에 받을 차례인 seq (중복 검출용)
+
+	// 피기배킹: 보류 중인 ACK
+	volatile int m_pendingAckSeq; // 보류 중인 ACK seq (-1 = 없음)
+	DWORD m_pendingAckTime;       // 보류 ACK 생성 시각 (GetTickCount)
 };
