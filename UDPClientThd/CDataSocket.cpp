@@ -14,7 +14,7 @@ CDataSocket::~CDataSocket()
 {
 }
 
-// 데이터 수신 이벤트 — 다이얼로그에 처리 위임
+// 데이터 수신 이벤트, 다이얼로그에 처리 위임
 void CDataSocket::OnReceive(int nErrorCode)
 {
 	CSocket::OnReceive(nErrorCode);

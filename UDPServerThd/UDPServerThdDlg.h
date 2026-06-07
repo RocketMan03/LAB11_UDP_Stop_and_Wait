@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 
+// frame_type: 0=DATA, 1=ACK, 2=NAK
 struct Frame
 {
 	int seq_num;
@@ -15,6 +16,7 @@ struct Frame
 	int checksum;
 	int Frame_num;      // 메시지 내 프레임 번호 (0부터)
 	int is_last_Frame;  // 마지막 프레임이면 1, 아니면 0
+	int frame_type;     // 0=DATA, 1=ACK, 2=NAK
 	TCHAR p_buffer[8];  // 8 TCHAR = 16바이트 페이로드
 
 	Frame() {
@@ -23,6 +25,7 @@ struct Frame
 		checksum = 0;
 		Frame_num = 0;
 		is_last_Frame = 0;
+		frame_type = 0;
 		memset(p_buffer, 0, sizeof(p_buffer));
 	}
 };
@@ -77,4 +80,10 @@ public:
 	CEdit m_CheckSum_tx;
 
 	std::vector<Frame> m_reassemBuf; // 수신 프레임 재조합 버퍼
+
+	// Stop-and-Wait ACK 동기화
+	HANDLE m_hAckEvent;      // TX 스레드가 ACK/NAK 도착을 기다리는 이벤트
+	volatile int m_ackSeqNum; // 수신된 ACK/NAK의 ack_num
+	volatile int m_ackType;   // 1=ACK, 2=NAK
+	int m_expectedSeq;   // 다음에 받을 차례인 seq (중복 검출용)
 };
